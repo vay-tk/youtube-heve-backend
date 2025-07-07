@@ -103,7 +103,7 @@ async def upload_cookies(cookies: UploadFile = File(...)):
             content = await cookies.read()
             await f.write(content)
         
-        return {"message": "Cookies uploaded successfully"}
+        return {"message": "Cookies uploaded successfully. This will help access private or age-restricted videos."}
     except HTTPException:
         raise
     except Exception as e:
@@ -122,11 +122,12 @@ async def start_download(request: DownloadRequest, background_tasks: BackgroundT
             "youtube.com/watch",
             "youtu.be/",
             "youtube.com/embed/",
-            "youtube.com/v/"
+            "youtube.com/v/",
+            "m.youtube.com/watch"
         ]
         
         if not any(pattern in request.url for pattern in youtube_patterns):
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+            raise HTTPException(status_code=400, detail="Please provide a valid YouTube URL")
         
         task_id = str(uuid.uuid4())[:12]
         
@@ -175,7 +176,7 @@ async def download_file(task_id: str):
     file_path = DOWNLOADS_DIR / f"{task_id}.mkv"
     
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found or has been cleaned up")
     
     return FileResponse(
         path=file_path,
@@ -215,7 +216,19 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         tasks[task_id]["message"] = "Extracting video information..."
         
         # Extract video info
-        video_info = await downloader.extract_info(url)
+        try:
+            video_info = await downloader.extract_info(url)
+        except Exception as e:
+            error_msg = str(e)
+            if "video access blocked" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}\n\n💡 Try uploading a cookies.txt file to access this video."
+            elif "access forbidden" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}\n\n💡 This video may be region-locked or require authentication."
+            elif "video not found" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}\n\n💡 Please check the URL and try again."
+            else:
+                tasks[task_id]["message"] = f"❌ {error_msg}"
+            raise
         
         if not video_info:
             raise Exception("Could not extract video information")
@@ -228,21 +241,43 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         
         # Update status: downloading
         tasks[task_id]["progress"] = "downloading"
-        tasks[task_id]["message"] = "Downloading video..."
+        tasks[task_id]["message"] = f"Downloading: {video_info.get('title', 'Unknown')}"
         
         # Download video
-        temp_file = await downloader.download_video(url, task_id)
+        try:
+            temp_file = await downloader.download_video(url, task_id)
+        except Exception as e:
+            error_msg = str(e)
+            if "youtube is blocking" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}"
+            elif "access forbidden" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}"
+            elif "video not found" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}"
+            elif "private video" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ {error_msg}"
+            else:
+                tasks[task_id]["message"] = f"❌ Download failed: {error_msg}"
+            raise
         
         if not temp_file or not temp_file.exists():
             raise Exception("Download failed - no file created")
         
         # Update status: converting
         tasks[task_id]["progress"] = "converting"
-        tasks[task_id]["message"] = "Converting to HEVC..."
+        tasks[task_id]["message"] = "Converting to HEVC format..."
         
         # Convert to HEVC
         output_file = DOWNLOADS_DIR / f"{task_id}.mkv"
-        await downloader.convert_to_hevc(temp_file, output_file)
+        try:
+            await downloader.convert_to_hevc(temp_file, output_file)
+        except Exception as e:
+            error_msg = str(e)
+            if "hevc encoder" in error_msg.lower():
+                tasks[task_id]["message"] = "⚠️ HEVC not available, using H.264 instead..."
+            else:
+                tasks[task_id]["message"] = f"❌ Conversion failed: {error_msg}"
+                raise
         
         if not output_file.exists():
             raise Exception("Conversion failed - no output file created")
@@ -254,12 +289,13 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         # Update status: ready
         tasks[task_id]["status"] = "ready"
         tasks[task_id]["progress"] = "ready"
-        tasks[task_id]["message"] = "Video ready for download!"
+        tasks[task_id]["message"] = "✅ Video ready for download!"
         tasks[task_id]["filename"] = f"{task_id}.mkv"
         
     except Exception as e:
         tasks[task_id]["status"] = "error"
-        tasks[task_id]["message"] = f"Error: {str(e)}"
+        if not tasks[task_id].get("message", "").startswith("❌"):
+            tasks[task_id]["message"] = f"❌ Error: {str(e)}"
         print(f"Download error for task {task_id}: {str(e)}")
         
         # Clean up any temp files on error
