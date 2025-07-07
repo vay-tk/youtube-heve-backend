@@ -13,15 +13,26 @@ class VideoDownloader:
     def __init__(self):
         self.cookies_file = Path("cookies.txt")
         self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
         ]
+        # Track failed attempts for rate limiting
+        self.failed_attempts = 0
+        self.last_attempt_time = 0
     
     def get_ydl_opts(self, download=True):
-        """Get yt-dlp options with anti-detection measures"""
+        """Get yt-dlp options with enhanced anti-detection measures"""
+        # Calculate delay based on failed attempts
+        base_delay = 1 + (self.failed_attempts * 2)
+        current_time = time.time()
+        if current_time - self.last_attempt_time < base_delay:
+            time.sleep(base_delay - (current_time - self.last_attempt_time))
+        
         opts = {
             'quiet': True,
             'no_warnings': True,
@@ -29,16 +40,38 @@ class VideoDownloader:
             'user_agent': random.choice(self.user_agents),
             'referer': 'https://www.youtube.com/',
             'headers': {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
                 'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
             },
-            'sleep_interval': 1,
-            'max_sleep_interval': 5,
-            'sleep_interval_subtitles': 1,
+            'sleep_interval': 2,
+            'max_sleep_interval': 8,
+            'sleep_interval_subtitles': 2,
+            'http_chunk_size': 10485760,
+            'extractor_retries': 3,
+            'retries': 5,
+            'fragment_retries': 10,
+            'file_access_retries': 5,
+            'socket_timeout': 30,
+            # Additional anti-detection measures
+            'youtube_include_dash_manifest': False,
+            'extract_flat': False,
+            'writethumbnail': False,
+            'writeinfojson': False,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'ignoreerrors': False,
+            'noplaylist': True,
+            'geo_bypass': True,
+            'age_limit': 99,
         }
         
         if not download:
@@ -47,48 +80,78 @@ class VideoDownloader:
         # Add cookies if available
         if self.cookies_file.exists():
             opts['cookiefile'] = str(self.cookies_file)
+            # Additional cookie-based options
+            opts['cookiesfrombrowser'] = None
         
         return opts
     
     async def extract_info(self, url: str) -> Optional[Dict[str, Any]]:
-        """Extract video information using yt-dlp with anti-detection"""
-        ydl_opts = self.get_ydl_opts(download=False)
+        """Extract video information using yt-dlp with enhanced anti-detection"""
+        max_retries = 3
+        retry_count = 0
         
-        def _extract():
+        while retry_count < max_retries:
             try:
-                # Add random delay to avoid rate limiting
-                time.sleep(random.uniform(1, 3))
+                ydl_opts = self.get_ydl_opts(download=False)
                 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                print(f"yt-dlp extract error: {error_msg}")
+                def _extract():
+                    try:
+                        # Add random delay to avoid rate limiting
+                        delay = random.uniform(3, 7) + (retry_count * 2)
+                        time.sleep(delay)
+                        
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            return ydl.extract_info(url, download=False)
+                    except yt_dlp.utils.DownloadError as e:
+                        error_msg = str(e)
+                        print(f"yt-dlp extract error (attempt {retry_count + 1}): {error_msg}")
+                        
+                        # Check for specific YouTube blocking patterns
+                        if any(phrase in error_msg.lower() for phrase in [
+                            'sign in to confirm', 'not a bot', 'private video', 
+                            'video unavailable', 'removed by the user'
+                        ]):
+                            raise Exception(f"Video access blocked: {error_msg}")
+                        elif 'http error 403' in error_msg.lower():
+                            raise Exception("Access forbidden - video may be region-locked or require authentication")
+                        elif 'http error 404' in error_msg.lower():
+                            raise Exception("Video not found - it may have been deleted or made private")
+                        elif 'http error 429' in error_msg.lower():
+                            # Rate limited - will retry
+                            raise yt_dlp.utils.DownloadError("Rate limited")
+                        else:
+                            raise Exception(f"Failed to extract video info: {error_msg}")
+                    except Exception as e:
+                        print(f"Unexpected extract error: {e}")
+                        raise Exception(f"Could not extract video information: {str(e)}")
                 
-                # Check for specific YouTube blocking patterns
-                if any(phrase in error_msg.lower() for phrase in [
-                    'sign in to confirm', 'not a bot', 'private video', 
-                    'video unavailable', 'removed by the user'
-                ]):
-                    raise Exception(f"Video access blocked: {error_msg}")
-                elif 'http error 403' in error_msg.lower():
-                    raise Exception("Access forbidden - video may be region-locked or require authentication")
-                elif 'http error 404' in error_msg.lower():
-                    raise Exception("Video not found - it may have been deleted or made private")
-                else:
-                    raise Exception(f"Failed to extract video info: {error_msg}")
+                # Run in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                info = await loop.run_in_executor(None, _extract)
+                
+                # Success - reset failed attempts
+                self.failed_attempts = 0
+                return info
+                
             except Exception as e:
-                print(f"Unexpected extract error: {e}")
-                raise Exception(f"Could not extract video information: {str(e)}")
+                retry_count += 1
+                self.failed_attempts += 1
+                self.last_attempt_time = time.time()
+                
+                error_msg = str(e)
+                print(f"Extract info error (attempt {retry_count}): {error_msg}")
+                
+                # If rate limited or bot detection, wait longer before retry
+                if retry_count < max_retries and ('rate limited' in error_msg.lower() or 'bot' in error_msg.lower()):
+                    wait_time = random.uniform(10, 20) + (retry_count * 5)
+                    print(f"Waiting {wait_time:.1f} seconds before retry...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                # Last attempt or non-retryable error
+                raise e
         
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        try:
-            info = await loop.run_in_executor(None, _extract)
-            return info
-        except Exception as e:
-            print(f"Extract info error: {e}")
-            raise
+        raise Exception("Max retries exceeded")
     
     async def download_video(self, url: str, task_id: str) -> Optional[Path]:
         """Download video using yt-dlp with enhanced error handling"""
@@ -96,58 +159,115 @@ class VideoDownloader:
         temp_dir.mkdir(exist_ok=True)
         
         output_template = str(temp_dir / f"{task_id}_temp.%(ext)s")
+        max_retries = 3
+        retry_count = 0
         
-        ydl_opts = self.get_ydl_opts(download=True)
-        ydl_opts.update({
-            # Prefer MP4 format for better compatibility
-            'format': 'best[ext=mp4][height<=720]/best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
-            'outtmpl': output_template,
-            'writesubtitles': False,
-            'writeautomaticsub': False,
-            'ignoreerrors': False,
-            'retries': 3,
-            'fragment_retries': 5,
-            'file_access_retries': 3,
-            'socket_timeout': 30,
-            'merge_output_format': 'mp4',  # Force MP4 container
-        })
-        
-        def _download():
+        while retry_count < max_retries:
             try:
-                # Add random delay
-                time.sleep(random.uniform(2, 5))
+                ydl_opts = self.get_ydl_opts(download=True)
+                ydl_opts.update({
+                    # Prefer MP4 format for better compatibility
+                    'format': 'best[ext=mp4][height<=720]/best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
+                    'outtmpl': output_template,
+                    'writesubtitles': False,
+                    'writeautomaticsub': False,
+                    'ignoreerrors': False,
+                    'merge_output_format': 'mp4',  # Force MP4 container
+                    # Enhanced retry settings
+                    'retries': 5,
+                    'fragment_retries': 10,
+                    'file_access_retries': 5,
+                    'socket_timeout': 45,
+                    'http_chunk_size': 10485760,
+                })
                 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                    return True
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                print(f"yt-dlp download error: {error_msg}")
+                def _download():
+                    try:
+                        # Add random delay based on retry count
+                        delay = random.uniform(5, 10) + (retry_count * 3)
+                        time.sleep(delay)
+                        
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([url])
+                            return True
+                    except yt_dlp.utils.DownloadError as e:
+                        error_msg = str(e)
+                        print(f"yt-dlp download error (attempt {retry_count + 1}): {error_msg}")
+                        
+                        # Provide specific error messages
+                        if any(phrase in error_msg.lower() for phrase in [
+                            'sign in to confirm', 'not a bot'
+                        ]):
+                            raise Exception("YouTube is blocking automated access. Please try uploading cookies.txt file or try again later.")
+                        elif 'http error 403' in error_msg.lower():
+                            raise Exception("Access forbidden. Video may be region-locked, private, or require authentication. Try uploading cookies.txt.")
+                        elif 'http error 404' in error_msg.lower():
+                            raise Exception("Video not found. It may have been deleted, made private, or the URL is incorrect.")
+                        elif 'http error 429' in error_msg.lower():
+                            # Rate limited - will retry
+                            raise yt_dlp.utils.DownloadError("Rate limited")
+                        elif 'private video' in error_msg.lower():
+                            raise Exception("This is a private video. You need to upload cookies.txt from a logged-in session.")
+                        elif 'video unavailable' in error_msg.lower():
+                            raise Exception("Video is unavailable. It may be region-locked or removed.")
+                        else:
+                            raise Exception(f"Download failed: {error_msg}")
+                    except Exception as e:
+                        print(f"Unexpected download error: {e}")
+                        raise Exception(f"Download failed: {str(e)}")
                 
-                # Provide specific error messages
-                if any(phrase in error_msg.lower() for phrase in [
-                    'sign in to confirm', 'not a bot'
-                ]):
-                    raise Exception("YouTube is blocking automated access. Please try uploading cookies.txt file or try again later.")
-                elif 'http error 403' in error_msg.lower():
-                    raise Exception("Access forbidden. Video may be region-locked, private, or require authentication. Try uploading cookies.txt.")
-                elif 'http error 404' in error_msg.lower():
-                    raise Exception("Video not found. It may have been deleted, made private, or the URL is incorrect.")
-                elif 'private video' in error_msg.lower():
-                    raise Exception("This is a private video. You need to upload cookies.txt from a logged-in session.")
-                elif 'video unavailable' in error_msg.lower():
-                    raise Exception("Video is unavailable. It may be region-locked or removed.")
-                else:
-                    raise Exception(f"Download failed: {error_msg}")
+                # Run in thread pool
+                loop = asyncio.get_event_loop()
+                success = await loop.run_in_executor(None, _download)
+                
+                if not success:
+                    raise Exception("Download failed - unknown error")
+                
+                # Find the downloaded file
+                downloaded_files = list(temp_dir.glob(f"{task_id}_temp.*"))
+                if not downloaded_files:
+                    raise Exception("Download completed but no file was created")
+                
+                # Get the largest file (in case multiple formats were downloaded)
+                downloaded_file = max(downloaded_files, key=lambda f: f.stat().st_size)
+                
+                if downloaded_file.stat().st_size == 0:
+                    raise Exception("Downloaded file is empty")
+                
+                # Validate the file is a proper video file
+                if not await self.validate_video_file(downloaded_file):
+                    raise Exception("Downloaded file is not a valid video file")
+                
+                # Success - reset failed attempts
+                self.failed_attempts = 0
+                return downloaded_file
+                
             except Exception as e:
-                print(f"Unexpected download error: {e}")
-                raise Exception(f"Download failed: {str(e)}")
+                retry_count += 1
+                self.failed_attempts += 1
+                self.last_attempt_time = time.time()
+                
+                error_msg = str(e)
+                print(f"Download error (attempt {retry_count}): {error_msg}")
+                
+                # Clean up any partial downloads
+                for temp_file in temp_dir.glob(f"{task_id}_temp.*"):
+                    try:
+                        temp_file.unlink()
+                    except:
+                        pass
+                
+                # If rate limited or bot detection, wait longer before retry
+                if retry_count < max_retries and ('rate limited' in error_msg.lower() or 'bot' in error_msg.lower()):
+                    wait_time = random.uniform(15, 30) + (retry_count * 10)
+                    print(f"Waiting {wait_time:.1f} seconds before retry...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                # Last attempt or non-retryable error
+                raise e
         
-        # Run in thread pool
-        loop = asyncio.get_event_loop()
-        try:
-            success = await loop.run_in_executor(None, _download)
-            if not success:
+        raise Exception("Max retries exceeded")
                 raise Exception("Download failed - unknown error")
             
             # Find the downloaded file
@@ -335,3 +455,65 @@ class VideoDownloader:
         except Exception as e:
             print(f"Conversion error: {e}")
             raise
+
+    async def extract_info_with_fallback(self, url: str) -> Optional[Dict[str, Any]]:
+        """Try different extraction strategies if the main one fails"""
+        strategies = [
+            # Strategy 1: Standard extraction
+            {'name': 'standard', 'opts': {}},
+            
+            # Strategy 2: Disable age gating
+            {'name': 'no_age_gate', 'opts': {'age_limit': 0}},
+            
+            # Strategy 3: Use different extractors
+            {'name': 'generic', 'opts': {'default_search': 'ytsearch', 'extract_flat': False}},
+            
+            # Strategy 4: Bypass geo-restrictions more aggressively
+            {'name': 'geo_bypass', 'opts': {'geo_bypass': True, 'geo_bypass_country': 'US'}},
+            
+            # Strategy 5: Try without cookies
+            {'name': 'no_cookies', 'opts': {'cookiefile': None}},
+        ]
+        
+        last_error = None
+        
+        for strategy in strategies:
+            try:
+                print(f"Trying extraction strategy: {strategy['name']}")
+                
+                # Get base options
+                ydl_opts = self.get_ydl_opts(download=False)
+                
+                # Apply strategy-specific options
+                ydl_opts.update(strategy['opts'])
+                
+                def _extract():
+                    try:
+                        # Add random delay
+                        time.sleep(random.uniform(2, 5))
+                        
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            return ydl.extract_info(url, download=False)
+                    except Exception as e:
+                        print(f"Strategy {strategy['name']} failed: {e}")
+                        raise
+                
+                # Run in thread pool
+                loop = asyncio.get_event_loop()
+                info = await loop.run_in_executor(None, _extract)
+                
+                if info:
+                    print(f"Success with strategy: {strategy['name']}")
+                    return info
+                    
+            except Exception as e:
+                last_error = e
+                # Wait before trying next strategy
+                await asyncio.sleep(random.uniform(3, 6))
+                continue
+        
+        # If all strategies failed, raise the last error
+        if last_error:
+            raise last_error
+        else:
+            raise Exception("All extraction strategies failed")
