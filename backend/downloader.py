@@ -13,19 +13,122 @@ class VideoDownloader:
     def __init__(self):
         self.cookies_file = Path("cookies.txt")
         self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15'
         ]
         # Track failed attempts for rate limiting
         self.failed_attempts = 0
         self.last_attempt_time = 0
+        # Try to detect browser installation for cookie extraction
+        self.detected_browsers = self._detect_browsers()
     
-    def get_ydl_opts(self, download=True):
+    def _detect_browsers(self):
+        """Detect available browsers for cookie extraction"""
+        browsers = []
+        
+        # Common browser executables and their names
+        browser_checks = [
+            ('chrome', ['chrome', 'google-chrome', 'chromium', 'chrome.exe']),
+            ('firefox', ['firefox', 'firefox.exe']),
+            ('edge', ['msedge', 'msedge.exe']),
+            ('safari', ['safari']),
+            ('opera', ['opera', 'opera.exe']),
+        ]
+        
+        for browser_name, executables in browser_checks:
+            for exe in executables:
+                try:
+                    # Try to find the executable
+                    result = subprocess.run(['where' if os.name == 'nt' else 'which', exe], 
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        browsers.append(browser_name)
+                        break
+                except:
+                    continue
+        
+        return browsers
+    
+    def validate_cookies_file(self) -> dict:
+        """Validate the cookies.txt file and return status info"""
+        if not self.cookies_file.exists():
+            return {
+                "valid": False,
+                "error": "cookies.txt file not found",
+                "size": 0,
+                "line_count": 0
+            }
+        
+        try:
+            with open(self.cookies_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                lines = content.strip().split('\n')
+                
+            # Basic validation
+            if not content.strip():
+                return {
+                    "valid": False,
+                    "error": "cookies.txt is empty",
+                    "size": 0,
+                    "line_count": 0
+                }
+            
+            # Check for Netscape format indicators
+            valid_lines = 0
+            youtube_cookies = 0
+            
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Split by tabs (Netscape format)
+                parts = line.split('\t')
+                if len(parts) >= 6:
+                    valid_lines += 1
+                    # Check if it's a YouTube cookie
+                    if '.youtube.com' in parts[0] or 'youtube.com' in parts[0]:
+                        youtube_cookies += 1
+            
+            if valid_lines == 0:
+                return {
+                    "valid": False,
+                    "error": "No valid cookie entries found (expected Netscape format)",
+                    "size": len(content),
+                    "line_count": len(lines)
+                }
+            
+            if youtube_cookies == 0:
+                return {
+                    "valid": False,
+                    "error": "No YouTube cookies found - make sure to export cookies from youtube.com",
+                    "size": len(content),
+                    "line_count": len(lines),
+                    "valid_entries": valid_lines
+                }
+            
+            return {
+                "valid": True,
+                "size": len(content),
+                "line_count": len(lines),
+                "valid_entries": valid_lines,
+                "youtube_cookies": youtube_cookies
+            }
+            
+        except Exception as e:
+            return {
+                "valid": False,
+                "error": f"Failed to read cookies.txt: {str(e)}",
+                "size": 0,
+                "line_count": 0
+            }
+    
+    def get_ydl_opts(self, download=True, use_browser_cookies=False):
         """Get yt-dlp options with enhanced anti-detection measures"""
         # Calculate delay based on failed attempts
         base_delay = 1 + (self.failed_attempts * 2)
@@ -33,11 +136,14 @@ class VideoDownloader:
         if current_time - self.last_attempt_time < base_delay:
             time.sleep(base_delay - (current_time - self.last_attempt_time))
         
+        # Select a random user agent
+        selected_ua = random.choice(self.user_agents)
+        
         opts = {
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-            'user_agent': random.choice(self.user_agents),
+            'user_agent': selected_ua,
             'referer': 'https://www.youtube.com/',
             'headers': {
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
@@ -51,6 +157,7 @@ class VideoDownloader:
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1',
                 'Cache-Control': 'max-age=0',
+                'User-Agent': selected_ua,
             },
             'sleep_interval': 2,
             'max_sleep_interval': 8,
@@ -72,16 +179,35 @@ class VideoDownloader:
             'noplaylist': True,
             'geo_bypass': True,
             'age_limit': 99,
+            # Additional YouTube-specific options
+            'prefer_insecure': False,
+            'no_check_certificate': False,
         }
         
         if not download:
             opts['skip_download'] = True
         
-        # Add cookies if available
-        if self.cookies_file.exists():
+        # Cookie handling priority:
+        # 1. Browser cookies (if requested and available)
+        # 2. Uploaded cookies.txt file
+        # 3. No cookies (fallback)
+        
+        if use_browser_cookies and self.detected_browsers:
+            # Try to use browser cookies - Chrome first, then others
+            browser_priority = ['chrome', 'firefox', 'edge', 'safari', 'opera']
+            for browser in browser_priority:
+                if browser in self.detected_browsers:
+                    try:
+                        opts['cookiesfrombrowser'] = (browser, None)
+                        print(f"Using cookies from {browser} browser")
+                        break
+                    except:
+                        continue
+        elif self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
             opts['cookiefile'] = str(self.cookies_file)
-            # Additional cookie-based options
-            opts['cookiesfrombrowser'] = None
+            print(f"Using cookies from file: {self.cookies_file}")
+        else:
+            print("No cookies available - this may limit access to private/age-restricted videos")
         
         return opts
     
@@ -92,7 +218,9 @@ class VideoDownloader:
         
         while retry_count < max_retries:
             try:
-                ydl_opts = self.get_ydl_opts(download=False)
+                # Try browser cookies first, then file cookies
+                use_browser_cookies = retry_count == 0 and self.detected_browsers
+                ydl_opts = self.get_ydl_opts(download=False, use_browser_cookies=use_browser_cookies)
                 
                 def _extract():
                     try:
@@ -164,7 +292,9 @@ class VideoDownloader:
         
         while retry_count < max_retries:
             try:
-                ydl_opts = self.get_ydl_opts(download=True)
+                # Try browser cookies first, then file cookies
+                use_browser_cookies = retry_count == 0 and self.detected_browsers
+                ydl_opts = self.get_ydl_opts(download=True, use_browser_cookies=use_browser_cookies)
                 ydl_opts.update({
                     # Prefer MP4 format for better compatibility
                     'format': 'best[ext=mp4][height<=720]/best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
@@ -431,20 +561,20 @@ class VideoDownloader:
     async def extract_info_with_fallback(self, url: str) -> Optional[Dict[str, Any]]:
         """Try different extraction strategies if the main one fails"""
         strategies = [
-            # Strategy 1: Standard extraction
-            {'name': 'standard', 'opts': {}},
+            # Strategy 1: Standard extraction with browser cookies
+            {'name': 'browser_cookies', 'opts': {'use_browser_cookies': True}},
             
-            # Strategy 2: Disable age gating
-            {'name': 'no_age_gate', 'opts': {'age_limit': 0}},
+            # Strategy 2: Standard extraction with file cookies
+            {'name': 'file_cookies', 'opts': {'use_browser_cookies': False}},
             
-            # Strategy 3: Use different extractors
-            {'name': 'generic', 'opts': {'default_search': 'ytsearch', 'extract_flat': False}},
-            
-            # Strategy 4: Bypass geo-restrictions more aggressively
+            # Strategy 3: No cookies but with geo bypass
             {'name': 'geo_bypass', 'opts': {'geo_bypass': True, 'geo_bypass_country': 'US'}},
             
-            # Strategy 5: Try without cookies
-            {'name': 'no_cookies', 'opts': {'cookiefile': None}},
+            # Strategy 4: Disable age gating
+            {'name': 'no_age_gate', 'opts': {'age_limit': 0}},
+            
+            # Strategy 5: Minimal options
+            {'name': 'minimal', 'opts': {'extract_flat': False, 'youtube_include_dash_manifest': False}},
         ]
         
         last_error = None
@@ -454,7 +584,8 @@ class VideoDownloader:
                 print(f"Trying extraction strategy: {strategy['name']}")
                 
                 # Get base options
-                ydl_opts = self.get_ydl_opts(download=False)
+                use_browser_cookies = strategy['opts'].pop('use_browser_cookies', False)
+                ydl_opts = self.get_ydl_opts(download=False, use_browser_cookies=use_browser_cookies)
                 
                 # Apply strategy-specific options
                 ydl_opts.update(strategy['opts'])
@@ -462,7 +593,7 @@ class VideoDownloader:
                 def _extract():
                     try:
                         # Add random delay
-                        time.sleep(random.uniform(2, 5))
+                        time.sleep(random.uniform(3, 7))
                         
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             return ydl.extract_info(url, download=False)
@@ -481,7 +612,7 @@ class VideoDownloader:
             except Exception as e:
                 last_error = e
                 # Wait before trying next strategy
-                await asyncio.sleep(random.uniform(3, 6))
+                await asyncio.sleep(random.uniform(5, 10))
                 continue
         
         # If all strategies failed, raise the last error
