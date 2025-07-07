@@ -123,7 +123,27 @@ async def upload_cookies(cookies: UploadFile = File(...)):
             content = await cookies.read()
             await f.write(content)
         
-        return {"message": "Cookies uploaded successfully. This will help access private or age-restricted videos."}
+        # Validate the uploaded cookies
+        downloader = VideoDownloader()
+        validation_result = downloader.validate_cookies_file()
+        
+        if validation_result["valid"]:
+            return {
+                "message": "Cookies uploaded and validated successfully! This will help access private or age-restricted videos.",
+                "validation": validation_result
+            }
+        else:
+            return {
+                "message": "Cookies uploaded but validation failed. The file may not work properly.",
+                "validation": validation_result,
+                "help": [
+                    "To export proper cookies.txt:",
+                    "1. Install a browser extension like 'Get cookies.txt LOCALLY'",
+                    "2. Go to youtube.com and make sure you're logged in",
+                    "3. Use the extension to export cookies for youtube.com",
+                    "4. Upload the resulting cookies.txt file"
+                ]
+            }
     except HTTPException:
         raise
     except Exception as e:
@@ -226,6 +246,40 @@ async def cleanup_task(task_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
+@app.get("/api/browser-cookies")
+async def get_browser_cookies_info():
+    """Get information about available browser cookies"""
+    try:
+        downloader = VideoDownloader()
+        
+        return {
+            "detected_browsers": downloader.detected_browsers,
+            "recommendations": [
+                "Browser cookie extraction works best with:",
+                "1. Chrome/Chromium (most reliable)",
+                "2. Firefox (good compatibility)",
+                "3. Edge (Windows users)",
+                "",
+                "To enable browser cookie extraction:",
+                "1. Make sure you're logged into YouTube in your browser",
+                "2. Close all browser instances before starting downloads",
+                "3. The API will automatically extract cookies from your browser",
+                "",
+                "If browser extraction fails, upload cookies.txt as a fallback."
+            ],
+            "browser_status": {
+                browser: "Available" for browser in downloader.detected_browsers
+            } if downloader.detected_browsers else {"none": "No browsers detected"}
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to get browser info: {str(e)}",
+            "detected_browsers": [],
+            "recommendations": [
+                "Browser detection failed - please upload cookies.txt manually"
+            ]
+        }
+
 @app.get("/api/troubleshoot")
 async def get_troubleshoot_info():
     """Get troubleshooting information for debugging YouTube access issues"""
@@ -236,10 +290,15 @@ async def get_troubleshoot_info():
         # Check yt-dlp version
         yt_dlp_version = yt_dlp.__version__
         
-        # Check if cookies file exists
-        cookies_file = Path("cookies.txt")
-        cookies_exists = cookies_file.exists()
-        cookies_size = cookies_file.stat().st_size if cookies_exists else 0
+        # Check browser cookies
+        downloader = VideoDownloader()
+        browser_info = {
+            "detected_browsers": downloader.detected_browsers,
+            "available": len(downloader.detected_browsers) > 0
+        }
+        
+        # Check and validate cookies file
+        cookies_validation = downloader.validate_cookies_file()
         
         # Check ffmpeg availability
         try:
@@ -271,11 +330,8 @@ async def get_troubleshoot_info():
         return {
             "timestamp": datetime.now().isoformat(),
             "yt_dlp_version": yt_dlp_version,
-            "cookies": {
-                "exists": cookies_exists,
-                "size_bytes": cookies_size,
-                "valid": cookies_exists and cookies_size > 0
-            },
+            "browser_cookies": browser_info,
+            "file_cookies": cookies_validation,
             "ffmpeg": {
                 "available": ffmpeg_available,
                 "version": ffmpeg_version
@@ -283,17 +339,23 @@ async def get_troubleshoot_info():
             "task_statistics": task_stats,
             "recent_errors": recent_errors[-5:],  # Last 5 errors
             "recommendations": [
+                "🆕 IMPROVED ANTI-BOT BYPASS:",
+                "• This version now supports automatic browser cookie extraction",
+                "• Browser cookies are tried first, then uploaded cookies.txt",
+                "• Supported browsers: Chrome, Firefox, Edge, Safari, Opera",
+                "",
                 "If you're getting 'Sign in to confirm you're not a bot' errors:",
-                "1. Export cookies.txt from your browser after logging into YouTube",
-                "2. Upload the cookies.txt file using the upload endpoint",
-                "3. Wait 10-15 minutes between failed attempts",
-                "4. Try downloading different videos to test",
+                "1. Make sure you're logged into YouTube in your browser",
+                "2. Close all browser instances before downloading",
+                "3. The API will automatically extract cookies from your browser",
+                "4. As a fallback, upload cookies.txt from your browser",
                 "",
                 "If downloads keep failing:",
-                "1. Check if the video is public and accessible",
-                "2. Verify the URL is correct",
+                "1. Check /api/browser-cookies to see detected browsers",
+                "2. Wait 10-15 minutes between failed attempts",
                 "3. Try videos from different channels",
-                "4. Consider using a VPN if region-locked"
+                "4. Check if the video is public and accessible",
+                "5. Consider using a VPN if region-locked"
             ]
         }
     except Exception as e:
@@ -309,7 +371,7 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
     try:
         # Update status: extracting
         tasks[task_id]["progress"] = "extracting"
-        tasks[task_id]["message"] = "Extracting video information..."
+        tasks[task_id]["message"] = "Extracting video information (trying browser cookies first)..."
         
         # Extract video info with fallback strategies
         try:
