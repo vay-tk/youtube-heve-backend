@@ -73,12 +73,29 @@ async def health_check():
         downloads_writable = os.access(DOWNLOADS_DIR, os.W_OK)
         temp_writable = os.access(TEMP_DIR, os.W_OK)
         
+        # Test ffmpeg
+        import subprocess
+        try:
+            ffmpeg_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=10)
+            ffmpeg_available = ffmpeg_result.returncode == 0
+        except:
+            ffmpeg_available = False
+        
+        # Test ffprobe
+        try:
+            ffprobe_result = subprocess.run(['ffprobe', '-version'], capture_output=True, timeout=10)
+            ffprobe_available = ffprobe_result.returncode == 0
+        except:
+            ffprobe_available = False
+        
         return {
             "status": "healthy",
             "downloads_dir": str(DOWNLOADS_DIR.absolute()),
             "temp_dir": str(TEMP_DIR.absolute()),
             "downloads_writable": downloads_writable,
             "temp_writable": temp_writable,
+            "ffmpeg_available": ffmpeg_available,
+            "ffprobe_available": ffprobe_available,
             "active_tasks": len(tasks),
             "python_version": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}"
         }
@@ -265,9 +282,9 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         
         # Update status: converting
         tasks[task_id]["progress"] = "converting"
-        tasks[task_id]["message"] = "Converting to HEVC format..."
+        tasks[task_id]["message"] = "Converting video to optimized format..."
         
-        # Convert to HEVC
+        # Convert to HEVC/H.264
         output_file = DOWNLOADS_DIR / f"{task_id}.mkv"
         try:
             await downloader.convert_to_hevc(temp_file, output_file)
@@ -275,11 +292,12 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
             error_msg = str(e)
             if "hevc encoder" in error_msg.lower():
                 tasks[task_id]["message"] = "⚠️ HEVC not available, using H.264 instead..."
+                # The downloader will handle fallback automatically
             else:
                 tasks[task_id]["message"] = f"❌ Conversion failed: {error_msg}"
                 raise
         
-        if not output_file.exists():
+        if not output_file.exists() or output_file.stat().st_size == 0:
             raise Exception("Conversion failed - no output file created")
         
         # Clean up temp file
@@ -291,6 +309,8 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         tasks[task_id]["progress"] = "ready"
         tasks[task_id]["message"] = "✅ Video ready for download!"
         tasks[task_id]["filename"] = f"{task_id}.mkv"
+        
+        print(f"Download completed successfully for task {task_id}")
         
     except Exception as e:
         tasks[task_id]["status"] = "error"
