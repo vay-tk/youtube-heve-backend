@@ -268,34 +268,6 @@ class VideoDownloader:
                 raise e
         
         raise Exception("Max retries exceeded")
-                raise Exception("Download failed - unknown error")
-            
-            # Find the downloaded file
-            downloaded_files = list(temp_dir.glob(f"{task_id}_temp.*"))
-            if not downloaded_files:
-                raise Exception("Download completed but no file was created")
-            
-            # Get the largest file (in case multiple formats were downloaded)
-            downloaded_file = max(downloaded_files, key=lambda f: f.stat().st_size)
-            
-            if downloaded_file.stat().st_size == 0:
-                raise Exception("Downloaded file is empty")
-            
-            # Validate the file is a proper video file
-            if not await self.validate_video_file(downloaded_file):
-                raise Exception("Downloaded file is not a valid video file")
-            
-            return downloaded_file
-            
-        except Exception as e:
-            print(f"Download error: {e}")
-            # Clean up any partial downloads
-            for temp_file in temp_dir.glob(f"{task_id}_temp.*"):
-                try:
-                    temp_file.unlink()
-                except:
-                    pass
-            raise
     
     async def validate_video_file(self, file_path: Path) -> bool:
         """Validate that the file is a proper video file using ffprobe"""
