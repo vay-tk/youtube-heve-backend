@@ -1,6 +1,9 @@
 import os
+import sys
 import uuid
 import asyncio
+import subprocess
+import uvicorn
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
@@ -223,8 +226,84 @@ async def cleanup_task(task_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
 
+@app.get("/api/troubleshoot")
+async def get_troubleshoot_info():
+    """Get troubleshooting information for debugging YouTube access issues"""
+    try:
+        import yt_dlp
+        from datetime import datetime
+        
+        # Check yt-dlp version
+        yt_dlp_version = yt_dlp.__version__
+        
+        # Check if cookies file exists
+        cookies_file = Path("cookies.txt")
+        cookies_exists = cookies_file.exists()
+        cookies_size = cookies_file.stat().st_size if cookies_exists else 0
+        
+        # Check ffmpeg availability
+        try:
+            ffmpeg_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=10)
+            ffmpeg_available = ffmpeg_result.returncode == 0
+            ffmpeg_version = ffmpeg_result.stdout.decode().split('\n')[0] if ffmpeg_available else "Not available"
+        except:
+            ffmpeg_available = False
+            ffmpeg_version = "Not available"
+        
+        # Get current task statistics
+        task_stats = {
+            "total_tasks": len(tasks),
+            "processing_tasks": len([t for t in tasks.values() if t.get("status") == "processing"]),
+            "ready_tasks": len([t for t in tasks.values() if t.get("status") == "ready"]),
+            "error_tasks": len([t for t in tasks.values() if t.get("status") == "error"]),
+        }
+        
+        # Recent errors
+        recent_errors = []
+        for task_id, task in tasks.items():
+            if task.get("status") == "error":
+                recent_errors.append({
+                    "task_id": task_id,
+                    "message": task.get("message", "Unknown error"),
+                    "url": task.get("url", "Unknown")
+                })
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "yt_dlp_version": yt_dlp_version,
+            "cookies": {
+                "exists": cookies_exists,
+                "size_bytes": cookies_size,
+                "valid": cookies_exists and cookies_size > 0
+            },
+            "ffmpeg": {
+                "available": ffmpeg_available,
+                "version": ffmpeg_version
+            },
+            "task_statistics": task_stats,
+            "recent_errors": recent_errors[-5:],  # Last 5 errors
+            "recommendations": [
+                "If you're getting 'Sign in to confirm you're not a bot' errors:",
+                "1. Export cookies.txt from your browser after logging into YouTube",
+                "2. Upload the cookies.txt file using the upload endpoint",
+                "3. Wait 10-15 minutes between failed attempts",
+                "4. Try downloading different videos to test",
+                "",
+                "If downloads keep failing:",
+                "1. Check if the video is public and accessible",
+                "2. Verify the URL is correct",
+                "3. Try videos from different channels",
+                "4. Consider using a VPN if region-locked"
+            ]
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to get troubleshoot info: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }
+
 async def download_video_task(task_id: str, url: str, rename: Optional[str] = None):
-    """Background task to download and convert video"""
+    """Background task to download and convert video with enhanced error handling"""
     downloader = VideoDownloader()
     
     try:
@@ -232,19 +311,33 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         tasks[task_id]["progress"] = "extracting"
         tasks[task_id]["message"] = "Extracting video information..."
         
-        # Extract video info
+        # Extract video info with fallback strategies
         try:
-            video_info = await downloader.extract_info(url)
+            # First try standard extraction
+            try:
+                video_info = await downloader.extract_info(url)
+            except Exception as e:
+                if "blocked" in str(e).lower() or "bot" in str(e).lower():
+                    # Try fallback strategies
+                    tasks[task_id]["message"] = "Standard extraction failed, trying alternative methods..."
+                    video_info = await downloader.extract_info_with_fallback(url)
+                else:
+                    raise e
+                    
         except Exception as e:
             error_msg = str(e)
-            if "video access blocked" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}\n\n💡 Try uploading a cookies.txt file to access this video."
+            if "video access blocked" in error_msg.lower() or "bot" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ YouTube is blocking access to this video.\n\n💡 Solutions:\n• Upload a valid cookies.txt file\n• Try again in a few minutes\n• The video may be region-locked or age-restricted"
             elif "access forbidden" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}\n\n💡 This video may be region-locked or require authentication."
+                tasks[task_id]["message"] = f"❌ Access forbidden.\n\n💡 This video may be:\n• Region-locked\n• Private or unlisted\n• Require authentication\n\nTry uploading cookies.txt from a logged-in session."
             elif "video not found" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}\n\n💡 Please check the URL and try again."
+                tasks[task_id]["message"] = f"❌ Video not found.\n\n💡 Please check:\n• The URL is correct\n• The video hasn't been deleted\n• The video isn't private"
+            elif "max retries exceeded" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Multiple attempts failed.\n\n💡 YouTube is actively blocking requests. Please:\n• Wait 10-15 minutes before trying again\n• Upload fresh cookies.txt\n• Try a different video"
             else:
-                tasks[task_id]["message"] = f"❌ {error_msg}"
+                tasks[task_id]["message"] = f"❌ Extraction failed: {error_msg}"
+            
+            tasks[task_id]["status"] = "error"
             raise
         
         if not video_info:
@@ -265,16 +358,20 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
             temp_file = await downloader.download_video(url, task_id)
         except Exception as e:
             error_msg = str(e)
-            if "youtube is blocking" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}"
+            if "youtube is blocking" in error_msg.lower() or "bot" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ YouTube is blocking the download.\n\n💡 Solutions:\n• Upload a valid cookies.txt file\n• Wait 10-15 minutes before retrying\n• Try a different video"
             elif "access forbidden" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}"
+                tasks[task_id]["message"] = f"❌ Download forbidden.\n\n💡 This video may be:\n• Region-locked\n• Private or require authentication\n• Age-restricted\n\nTry uploading cookies.txt from a logged-in session."
             elif "video not found" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}"
+                tasks[task_id]["message"] = f"❌ Video not found during download.\n\n💡 The video may have been:\n• Deleted or made private\n• Moved to a different URL"
             elif "private video" in error_msg.lower():
-                tasks[task_id]["message"] = f"❌ {error_msg}"
+                tasks[task_id]["message"] = f"❌ This is a private video.\n\n💡 You need to upload cookies.txt from a browser session where you're logged in and have access to this video."
+            elif "max retries exceeded" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Download failed after multiple attempts.\n\n💡 YouTube is actively blocking requests. Please:\n• Wait 15-30 minutes before trying again\n• Upload fresh cookies.txt\n• Check if the video is still available"
             else:
                 tasks[task_id]["message"] = f"❌ Download failed: {error_msg}"
+            
+            tasks[task_id]["status"] = "error"
             raise
         
         if not temp_file or not temp_file.exists():
@@ -295,6 +392,7 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
                 # The downloader will handle fallback automatically
             else:
                 tasks[task_id]["message"] = f"❌ Conversion failed: {error_msg}"
+                tasks[task_id]["status"] = "error"
                 raise
         
         if not output_file.exists() or output_file.stat().st_size == 0:
@@ -313,9 +411,11 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
         print(f"Download completed successfully for task {task_id}")
         
     except Exception as e:
-        tasks[task_id]["status"] = "error"
-        if not tasks[task_id].get("message", "").startswith("❌"):
-            tasks[task_id]["message"] = f"❌ Error: {str(e)}"
+        if tasks[task_id]["status"] != "error":
+            tasks[task_id]["status"] = "error"
+            if not tasks[task_id].get("message", "").startswith("❌"):
+                tasks[task_id]["message"] = f"❌ Error: {str(e)}"
+        
         print(f"Download error for task {task_id}: {str(e)}")
         
         # Clean up any temp files on error
@@ -326,6 +426,5 @@ async def download_video_task(task_id: str, url: str, rename: Optional[str] = No
             pass
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
