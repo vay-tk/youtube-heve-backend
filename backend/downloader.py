@@ -7,6 +7,7 @@ import ffmpeg
 import os
 import random
 import time
+import json
 
 class VideoDownloader:
     def __init__(self):
@@ -98,14 +99,17 @@ class VideoDownloader:
         
         ydl_opts = self.get_ydl_opts(download=True)
         ydl_opts.update({
-            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best[height<=480]/best',
+            # Prefer MP4 format for better compatibility
+            'format': 'best[ext=mp4][height<=720]/best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
             'outtmpl': output_template,
             'writesubtitles': False,
             'writeautomaticsub': False,
             'ignoreerrors': False,
             'retries': 3,
-            'fragment_retries': 3,
+            'fragment_retries': 5,
             'file_access_retries': 3,
+            'socket_timeout': 30,
+            'merge_output_format': 'mp4',  # Force MP4 container
         })
         
         def _download():
@@ -157,6 +161,10 @@ class VideoDownloader:
             if downloaded_file.stat().st_size == 0:
                 raise Exception("Downloaded file is empty")
             
+            # Validate the file is a proper video file
+            if not await self.validate_video_file(downloaded_file):
+                raise Exception("Downloaded file is not a valid video file")
+            
             return downloaded_file
             
         except Exception as e:
@@ -169,27 +177,78 @@ class VideoDownloader:
                     pass
             raise
     
+    async def validate_video_file(self, file_path: Path) -> bool:
+        """Validate that the file is a proper video file using ffprobe"""
+        def _validate():
+            try:
+                result = subprocess.run([
+                    'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                    '-show_format', '-show_streams', str(file_path)
+                ], capture_output=True, text=True, timeout=30)
+                
+                if result.returncode != 0:
+                    print(f"ffprobe failed: {result.stderr}")
+                    return False
+                
+                # Parse the JSON output
+                probe_data = json.loads(result.stdout)
+                
+                # Check if we have video streams
+                video_streams = [s for s in probe_data.get('streams', []) if s.get('codec_type') == 'video']
+                if not video_streams:
+                    print("No video streams found in file")
+                    return False
+                
+                # Check if format is recognized
+                format_info = probe_data.get('format', {})
+                if not format_info.get('format_name'):
+                    print("Unknown format")
+                    return False
+                
+                print(f"Video validation successful: {format_info.get('format_name')}")
+                return True
+                
+            except subprocess.TimeoutExpired:
+                print("Video validation timed out")
+                return False
+            except json.JSONDecodeError:
+                print("Failed to parse ffprobe output")
+                return False
+            except Exception as e:
+                print(f"Video validation error: {e}")
+                return False
+        
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _validate)
+    
     async def convert_to_hevc(self, input_file: Path, output_file: Path):
         """Convert video to HEVC using ffmpeg with better error handling"""
         def _convert():
             try:
-                # Check if ffmpeg is available
-                result = subprocess.run(['ffmpeg', '-version'], 
-                                      capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise Exception("FFmpeg is not available")
-                
-                # Get input file info first
+                # First, validate input file again
                 probe_result = subprocess.run([
                     'ffprobe', '-v', 'quiet', '-print_format', 'json', 
                     '-show_format', '-show_streams', str(input_file)
-                ], capture_output=True, text=True)
+                ], capture_output=True, text=True, timeout=30)
                 
                 if probe_result.returncode != 0:
-                    raise Exception("Could not analyze input video file")
+                    print(f"Input file validation failed: {probe_result.stderr}")
+                    raise Exception("Input file is corrupted or invalid")
                 
-                # Run conversion
-                cmd = [
+                # Parse probe data to get video info
+                try:
+                    probe_data = json.loads(probe_result.stdout)
+                    video_streams = [s for s in probe_data.get('streams', []) if s.get('codec_type') == 'video']
+                    if not video_streams:
+                        raise Exception("No video streams found in input file")
+                    
+                    print(f"Input video info: {video_streams[0].get('codec_name', 'unknown')} "
+                          f"{video_streams[0].get('width', '?')}x{video_streams[0].get('height', '?')}")
+                except:
+                    print("Could not parse video info, proceeding anyway...")
+                
+                # Try HEVC conversion first
+                hevc_cmd = [
                     'ffmpeg', '-i', str(input_file),
                     '-c:v', 'libx265',
                     '-c:a', 'aac',
@@ -198,56 +257,68 @@ class VideoDownloader:
                     '-preset', 'medium',
                     '-crf', '23',
                     '-movflags', 'faststart',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-fflags', '+genpts',
                     '-y',  # Overwrite output file
                     str(output_file)
                 ]
                 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30 min timeout
+                print("Starting HEVC conversion...")
+                result = subprocess.run(hevc_cmd, capture_output=True, text=True, timeout=1800)
                 
-                if result.returncode != 0:
-                    error_output = result.stderr
-                    if 'libx265' in error_output:
-                        raise Exception("HEVC encoder (libx265) not available. Using fallback H.264 encoding.")
-                    else:
-                        raise Exception(f"Video conversion failed: {error_output}")
+                if result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+                    print("HEVC conversion successful")
+                    return True
                 
-                # Verify output file was created and has content
-                if not output_file.exists() or output_file.stat().st_size == 0:
-                    raise Exception("Conversion completed but output file is missing or empty")
+                # If HEVC fails, try H.264
+                print("HEVC conversion failed, trying H.264...")
+                h264_cmd = [
+                    'ffmpeg', '-i', str(input_file),
+                    '-c:v', 'libx264',
+                    '-c:a', 'aac',
+                    '-b:a', '96k',
+                    '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    '-movflags', 'faststart',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-fflags', '+genpts',
+                    '-y',
+                    str(output_file)
+                ]
                 
-                return True
+                result = subprocess.run(h264_cmd, capture_output=True, text=True, timeout=1800)
+                
+                if result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+                    print("H.264 conversion successful")
+                    return True
+                
+                # If both fail, try simple copy with container change
+                print("Both encoders failed, trying simple remux...")
+                copy_cmd = [
+                    'ffmpeg', '-i', str(input_file),
+                    '-c', 'copy',
+                    '-movflags', 'faststart',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-y',
+                    str(output_file)
+                ]
+                
+                result = subprocess.run(copy_cmd, capture_output=True, text=True, timeout=600)
+                
+                if result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
+                    print("Simple remux successful")
+                    return True
+                
+                # If everything fails, provide detailed error
+                error_msg = result.stderr if result.stderr else "Unknown conversion error"
+                print(f"All conversion attempts failed. Last error: {error_msg}")
+                raise Exception(f"Video conversion failed: {error_msg}")
                 
             except subprocess.TimeoutExpired:
-                raise Exception("Video conversion timed out (file too large)")
-            except subprocess.CalledProcessError as e:
-                raise Exception(f"FFmpeg error: {e}")
+                raise Exception("Video conversion timed out (file too large or processing issue)")
             except Exception as e:
-                print(f"FFmpeg conversion error: {e}")
-                
-                # Fallback to H.264 if HEVC fails
-                if 'libx265' in str(e):
-                    try:
-                        print("Falling back to H.264 encoding...")
-                        cmd_fallback = [
-                            'ffmpeg', '-i', str(input_file),
-                            '-c:v', 'libx264',
-                            '-c:a', 'aac',
-                            '-b:a', '96k',
-                            '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2',
-                            '-preset', 'medium',
-                            '-crf', '23',
-                            '-movflags', 'faststart',
-                            '-y',
-                            str(output_file)
-                        ]
-                        
-                        result = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=1800)
-                        
-                        if result.returncode == 0 and output_file.exists() and output_file.stat().st_size > 0:
-                            return True
-                    except:
-                        pass
-                
+                print(f"Conversion error: {e}")
                 raise Exception(f"Video conversion failed: {str(e)}")
         
         # Run in thread pool
@@ -256,6 +327,11 @@ class VideoDownloader:
             success = await loop.run_in_executor(None, _convert)
             if not success:
                 raise Exception("Video conversion failed")
+            
+            # Final validation of output file
+            if not await self.validate_video_file(output_file):
+                raise Exception("Converted file is not valid")
+                
         except Exception as e:
             print(f"Conversion error: {e}")
             raise
